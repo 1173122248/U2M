@@ -1,0 +1,363 @@
+# ====================================================================
+# 011_UPSR_U2M_Train_x4_NewLoss.yml
+# 全新的不确定性网络训练策略:
+# 
+# 核心改变:
+# 1. ⚠️ 暂时禁用反向去噪阶段的σ调制 (_scale_input使用固定0.3)
+# 2. 🔧 使用全新的U2MLoss替代heteroscedastic loss
+# 3. 🎯 基于residual alignment + calibration的训练策略
+# 
+# 设计理念:
+# - 先训练好U²M网络的预测能力
+# - 让σ与残差模式对齐 (residual alignment)
+# - 让σ与实际误差相关 (calibration)
+# - 保持空间平滑性 (smoothness)
+# - 控制σ的幅度 (magnitude)
+# - 稳步推进,避免激进修改导致崩溃
+# ====================================================================
+
+name: 011_UPSR_U2M_Train_x4_NewLoss
+model_target: basicsr.models.upsr_real_model.UPSRRealModel
+scale: 4
+num_gpu: 1
+manual_seed: 0
+queue_size: 160
+
+use_u2m: true
+
+# Dataset configuration
+datasets:
+  train:
+    name: LSDIR
+    type: RealESRGANDataset
+    dataroot_gt: F:/ZZM/UPSR-main/basicsr/datasets/LSDIR
+    meta_info_file: F:/ZZM/UPSR-main/basicsr/data/meta_info/meta_info_LSDIR.txt
+    filename_tmpl: '{}'
+    io_backend:
+      type: disk
+
+    mean: 0.5
+    std: 0.5
+    blur_kernel_size: 21
+    kernel_list: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
+    kernel_prob: [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
+    sinc_prob: 0.1
+    blur_sigma: [0.2, 3]
+    betag_range: [0.5, 4]
+    betap_range: [1, 2]
+
+    blur_kernel_size2: 15
+    kernel_list2: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
+    kernel_prob2: [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
+    sinc_prob2: 0.1
+    blur_sigma2: [0.2, 1.5]
+    betag_range2: [0.5, 4]
+    betap_range2: [1, 2]
+
+    final_sinc_prob: 0.8
+
+    gt_size: 256
+    rescale_gt: False
+    crop_pad_size: 256
+    use_hflip: True
+    use_rot: True
+
+    num_worker_per_gpu: 6
+    batch_size_per_gpu: 8  # 降低以适应动态U2M的显存需求
+    micro_batchsize: 8
+    dataset_enlarge_ratio: 1
+    prefetch_mode: cuda
+    pin_memory: True
+    persistent_workers: True
+
+  # val_1:
+  #   name: Val_SR
+  #   type: PairedImageDataset
+  #   dataroot_gt: F:\ZZM\UPSR-main\basicsr/datasets/Val_SR/gt
+  #   dataroot_lq: F:\ZZM\UPSR-main\basicsr/datasets/Val_SR/lq
+  #   io_backend:
+  #     type: disk
+  #   batch_size: 8
+
+  val_1:
+    name: RealSet65
+    type: SingleImageDataset
+    dataroot_lq: F:\ZZM\UPSR-main\basicsr\datasets\RealSet65
+    io_backend:
+      type: disk
+
+  # val_1:
+  #   name: DIV2k
+  #   type: PairedImageDataset
+  #   dataroot_gt: D:\DataSets\DIV2k\DIV2K_valid_HR
+  #   dataroot_lq: D:\DataSets\DIV2k\DIV2K_valid_LR_bicubic\X4
+  #   io_backend:
+  #     type: disk
+  #   batch_size: 1
+
+  # val_2:
+  #   name: RealSRV3
+  #   type: PairedImageDataset
+  #   dataroot_gt: F:\ZZM\UPSR-main\basicsr\datasets\RealSRV3\HR
+  #   dataroot_lq: F:\ZZM\UPSR-main\basicsr\datasets\RealSRV3\LR\4
+  #   io_backend:
+  #     type: disk
+  #   batch_size: 1
+# Degradation settings
+degradation:
+  scale: 4
+  resize_prob: [0.2, 0.7, 0.1]
+  resize_range: [0.15, 1.5]
+  gaussian_noise_prob: 0.5
+  noise_range: [1, 30]
+  poisson_scale_range: [0.05, 3]
+  gray_noise_prob: 0.4
+  jpeg_range: [30, 95]
+
+  second_order_prob: 0.5
+  second_blur_prob: 0.8
+  resize_prob2: [0.3, 0.4, 0.3]
+  resize_range2: [0.3, 1.2]
+  gaussian_noise_prob2: 0.5
+  noise_range2: [1, 25]
+  poisson_scale_range2: [0.05, 2.5]
+  gray_noise_prob2: 0.4
+  jpeg_range2: [30, 95]
+
+  gt_size: 256
+  resize_back: False
+  use_sharp: False
+
+# Network configurations
+network_g:
+  target: basicsr.archs.swin_unet_arch.UNetModelSwin
+  params:
+    image_size: 64
+    in_channels: 48
+    model_channels: 160
+    out_channels: 3
+    attention_resolutions: [64, 32, 16, 8]
+    dropout: 0
+    channel_mult: [1, 2, 2, 4]
+    num_res_blocks: [2, 2, 2, 2]
+    conv_resample: True
+    dims: 2
+    use_fp16: False
+    num_head_channels: 32
+    use_scale_shift_norm: True
+    resblock_updown: False
+    swin_depth: 2
+    swin_embed_dim: 192
+    window_size: 8
+    mlp_ratio: 4.
+    cond_lq: True
+    lq_size: 64
+    num_feat: 128
+
+network_u2m:
+  in_channels: 6
+  base_channels: 32
+  num_encoder_blocks: 4
+  use_attention: true
+  decay_type: cosine
+  decay_min_value: 0.0
+
+# Diffusion configuration
+diffusion:
+  un: 0.1
+  min_noise: 0.4
+  target: models.script_util.create_gaussian_diffusion
+  params:
+    sf: 4
+    schedule_name: exponential
+    schedule_kwargs:
+      power: 0.2
+    etas_end: 0.99
+    steps: 5
+    min_noise_level: 0.2
+    kappa: 2.5
+    weighted_mse: False
+    predict_type: xstart
+    timestep_respacing:
+    scale_factor: 1.0
+    normalize_input: True
+    latent_flag: False
+  # === 动态U2M反向去噪配置 (内容自适应注入方案 - 改进版) ===
+  # 
+  # 核心改进 (基于REVERSE文档):
+  # 问题: 固定时间衰减γ(t)导致:
+  #   - 去噪不充分: 某些区域需要强去噪,但γ统一衰减 → 噪点残留
+  #   - 过度去噪: 某些区域已很好,但仍注入噪声 → 伪影/模糊
+  # 
+  # 解决方案: U²M输出global_v (图像级自适应强度 0~1)
+  #   - 复杂/欠去噪区域: global_v大 → 强噪声注入 → 重新去噪
+  #   - 已良好区域: global_v小 → 弱噪声 → 保护质量
+  #   - 内容自适应: 不同图像/时间步动态决定
+  #
+  # 公式改进:
+  #   旧: eps' = eps_hat + γ(t) * σ_map ⊙ z  [γ(t)固定时间衰减]
+  #   新: eps' = eps_hat + global_v * γ * σ_map ⊙ z  [global_v内容自适应]
+  #
+  # 输出:
+  #   - sigma_map (B,1,H,W): 空间局部调制
+  #   - global_v (B,1,1,1): 图像级强度 [NEW!]
+  #
+  # 参考: advise/REVERSE 文档
+  # 修复方案: 增强扰动+时间引导,避免指标持续下降
+  use_dynamic_u2m: true          # 启用内容自适应ε注入
+  u2m_noise_scale: 0.5           # 0.3 → 0.5 (增强扰动强度,给global_v更大影响)
+  u2m_apply_interval: 1          # 每步应用
+  use_time_bias: true            # false → true (添加时间引导,稳定训练)
+  
+  learnable_decay: false         # 不再需要时间衰减调度器
+
+network_mse:
+  target: basicsr.archs.atd_real_arch.ATD
+  ckpt:
+    path: experiments/pretrained_models/atd_real.pth
+    strict_load_mse: True
+    param_key_mse: params_ema
+  params:
+    upscale: 4
+    in_chans: 3
+    img_size: 64
+    embed_dim: 96
+    depths: [6, 6, 6, 6]
+    num_heads: [4, 4, 4, 4]
+    window_size: 16
+    category_size: 128
+    num_tokens: 64
+    reducted_dim: 8
+    convffn_kernel_size: 7
+    img_range: 1.
+    mlp_ratio: 1
+    upsampler: 'pixelshuffledirect'
+    resi_connection: '1conv'
+    use_checkpoint: False
+
+# Path configuration
+path:
+  # ===== 从56000 iter重启（CLIPIQA峰值点0.6265）=====
+  # 原因: 启用U²M加权LPIPS，需要重新初始化以加载新配置
+  # 策略: 只加载网络权重，不加载训练状态（优化器等）
+  pretrain_network_g: experiments\011_UPSR_U2M_Train_x4_NewLoss\models\net_g_3000.pth
+  #experiments\pretrained_models\upsr.pth
+  strict_load_g: true
+  pretrain_network_u2m: experiments\011_UPSR_U2M_Train_x4_NewLoss\models\net_u2m_3000.pth
+  strict_load_u2m: true
+  # === 从2k恢复 (CLIPIQA=0.6541, MUSIQ=65.4574峰值点) ===
+  resume_state: experiments\011_UPSR_U2M_Train_x4_NewLoss\training_states\3000.state
+# Training settings
+train:
+  use_fp16: True
+  ema_decay: 0.999
+
+  freeze_main_network: false
+  
+  # === 联合训练配置 ===
+  joint_u2m_training: true        # 启用U²M与主干的联合训练
+  u2m_to_backbone_weight: 0.15     # U²M损失回传到主干的权重(0.1表示10%的损失传回)
+
+  optim_g:
+    type: AdamW
+    lr: !!float 5e-6  # 1e-5 → 5e-6 (调整学习率避免过快)
+    weight_decay: 0
+
+  optim_u2m:
+    type: AdamW
+    lr: !!float 1e-4
+    weight_decay: !!float 1e-4
+    betas: [0.9, 0.999]
+
+  # ============ 新的U2MLoss配置 ============
+  # 基于residual alignment + calibration
+  u2m_loss_opt:
+    # 核心损失权重
+    lambda_r: 1.0       # Residual Alignment: σ应该预测残差模式
+    lambda_c: 0.5       # Calibration: σ应该与实际误差相关
+    lambda_s: 0.003     # 0.01 → 0.003 (大幅降低平滑约束,允许空间差异)
+    lambda_m: 0.002     # 0.01 → 0.002 (大幅降低magnitude惩罚,允许大sigma)
+    
+    # σ范围控制
+    sigma_min: 0.01     # 最小σ (相对值)
+    sigma_max: 0.75     # 0.45 → 0.75 (扩大最大σ,允许更强不确定性)
+    
+    # Calibration采样
+    calib_samples: 1024 # 每个样本采样点数(节省计算)
+    
+    # Residual weighting指数
+    gamma: 1.0          # 残差权重指数(1.0=线性)
+  # ==========================================
+
+  scheduler:
+    type: MultiStepLR
+    milestones: [5000, 10000, 15000]
+    gamma: 0.5
+
+  total_iter: 0
+  warmup_iter: 1000
+
+  pixel_opt:
+    type: L1Loss
+    loss_weight: 1.0
+    reduction: mean
+
+  perceptual_opt:
+    lpips_weight: 0.5  # 保持0.5(已调整),避免过度优化LPIPS
+
+
+# Validation settings
+val:
+  val_freq: !!float 10e2
+  suffix: ~
+  save_img: true
+  save_uncertainty: true
+  pbar: True
+  desired_min_size: 64
+  chop_size: 512
+  chop_stride: 448
+  chop_bs: 1
+  noise_repeat: False
+  
+  metrics:
+    psnr:
+      fr: True
+      better: higher
+    ssim:
+      fr: True
+      better: higher
+    lpips:
+      fr: True
+      better: lower
+    niqe:
+      fr: False
+      better: lower
+    clipiqa:
+      fr: False
+      better: higher
+    musiq:
+      fr: False
+      better: higher
+    fid:
+      fr: True
+      better: lower
+    dists:
+      fr: True
+      better: lower
+    maniqa:
+      fr: False
+      better: higher
+
+# Logging settings
+logger:
+  print_freq: 100
+  save_checkpoint_freq: !!float 10e2
+  use_tb_logger: True
+  wandb:
+    project: ~
+    resume_id: ~
+
+# Distribution training settings
+dist_params:
+  backend: nccl
+  port: 29500

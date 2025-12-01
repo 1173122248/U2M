@@ -1,0 +1,231 @@
+# ====================================================================
+# test_UPSR_U2M_x4.yml
+# U²M增强UPSR模型离线推理配置
+# 
+# 支持特性:
+# 1. U²M不确定性驱动的自适应去噪
+# 2. Global_v内容自适应噪声注入
+# 3. 动态ε空间扰动控制
+# ====================================================================
+
+name: test_UPSR_U2M_x4
+model_target: basicsr.models.upsr_real_model.UPSRRealModel
+scale: 4
+num_gpu: 1
+manual_seed: 0
+
+# 启用U²M模块
+use_u2m: true
+
+# 测试数据集配置
+datasets:
+  # === 测试集1: RealSet65 (无参考) ===
+  val_1:
+    name: RealSet65
+    type: SingleImageDataset
+    dataroot_lq: F:\ZZM\UPSR-main\basicsr\datasets\RealSet65
+    io_backend:
+      type: disk
+
+  # === 测试集2: Val_SR (有参考) ===
+  # val_1:
+  #   name: Val_SR
+  #   type: PairedImageDataset
+  #   dataroot_gt: F:\ZZM\UPSR-main\basicsr\datasets\Val_SR\gt
+  #   dataroot_lq: F:\ZZM\UPSR-main\basicsr\datasets\Val_SR\lq
+  #   io_backend:
+  #     type: disk
+
+  # === 测试集3: RealSRV3 (有参考) ===
+  # val_1:
+  #   name: RealSRV3
+  #   type: PairedImageDataset
+  #   dataroot_gt: F:\ZZM\UPSR-main\basicsr\datasets\RealSRV3\HR
+  #   dataroot_lq: F:\ZZM\UPSR-main\basicsr\datasets\RealSRV3\LR\4
+  #   io_backend:
+  #     type: disk
+
+  # val_2:
+  #   name: LSDIR-test
+  #   type: PairedImageDataset
+  #   dataroot_gt: D:\DataSets\LSDIR-test\HR\val
+  #   dataroot_lq: D:\DataSets\LSDIR-test\X4\val
+  #   io_backend:
+  #     type: disk
+  #   batch_size: 1
+  # === 测试集4: DIV2K验证集 ===
+  # val_3:
+  #   name: DIV2K
+  #   type: PairedImageDataset
+  #   dataroot_gt: D:\DataSets\DIV2k\DIV2K_valid_HR
+  #   dataroot_lq: D:\DataSets\DIV2k\DIV2K_valid_LR_bicubic\X4
+  #   io_backend:
+  #     type: disk
+
+# 主干网络配置
+network_g:
+  target: basicsr.archs.swin_unet_arch.UNetModelSwin
+  params:
+    image_size: 64
+    in_channels: 48
+    model_channels: 160
+    out_channels: 3
+    attention_resolutions: [64, 32, 16, 8]
+    dropout: 0
+    channel_mult: [1, 2, 2, 4]
+    num_res_blocks: [2, 2, 2, 2]
+    conv_resample: True
+    dims: 2
+    use_fp16: False
+    num_head_channels: 32
+    use_scale_shift_norm: True
+    resblock_updown: False
+    swin_depth: 2
+    swin_embed_dim: 192
+    window_size: 8
+    mlp_ratio: 4.
+    cond_lq: True
+    lq_size: 64
+    num_feat: 128
+
+# U²M网络配置
+network_u2m:
+  in_channels: 6
+  base_channels: 32
+  num_encoder_blocks: 4
+  use_attention: true
+  decay_type: cosine
+  decay_min_value: 0.0
+
+# 扩散模型配置
+diffusion:
+  un: 0.1
+  min_noise: 0.4
+  target: models.script_util.create_gaussian_diffusion
+  params:
+    sf: 4
+    schedule_name: exponential
+    schedule_kwargs:
+      power: 0.2
+    etas_end: 0.99
+    steps: 5
+    min_noise_level: 0.2
+    kappa: 2.5
+    weighted_mse: False
+    predict_type: xstart
+    timestep_respacing: ~
+    scale_factor: 1.0
+    normalize_input: True
+    latent_flag: False
+  
+  # === 动态U²M推理配置 ===
+  use_dynamic_u2m: true          # 启用U²M自适应控制
+  u2m_noise_scale: 0.5           # gamma缩放系数
+  u2m_apply_interval: 1          # 每步应用
+  use_time_bias: true            # 启用时间引导
+  learnable_decay: false
+
+# ATD网络配置
+network_mse:
+  target: basicsr.archs.atd_real_arch.ATD
+  ckpt:
+    path: experiments/pretrained_models/atd_real.pth
+    strict_load_mse: True
+    param_key_mse: params_ema
+  params:
+    upscale: 4
+    in_chans: 3
+    img_size: 64
+    embed_dim: 96
+    depths: [6, 6, 6, 6]
+    num_heads: [4, 4, 4, 4]
+    window_size: 16
+    category_size: 128
+    num_tokens: 64
+    reducted_dim: 8
+    convffn_kernel_size: 7
+    img_range: 1.
+    mlp_ratio: 1
+    upsampler: 'pixelshuffledirect'
+    resi_connection: '1conv'
+    use_checkpoint: False
+
+# 模型路径配置
+path:
+  # === 主干网络权重 ===
+  pretrain_network_g: experiments\011_UPSR_U2M_Train_x4_NewLoss\models\net_g_3000.pth
+  strict_load_g: true
+  
+  # === U²M网络权重 ===
+  pretrain_network_u2m: experiments\011_UPSR_U2M_Train_x4_NewLoss\models\net_u2m_3000.pth
+  strict_load_u2m: true
+  
+  # 不需要恢复训练状态
+  resume_state: ~
+
+# 推理设置
+val:
+  suffix: ~                      # 输出文件名后缀
+  save_img: true                 # 保存超分图像
+  save_uncertainty: false         # 保存不确定性地图
+  pbar: true                     # 显示进度条
+  
+  # 大图切块推理配置
+  desired_min_size: 64           # 最小分块尺寸
+  chop_size: 512                 # 切块大小(根据显存调整)
+  chop_stride: 448               # 切块步长(重叠64像素)
+  chop_bs: 1                     # 切块批大小
+  noise_repeat: false            # 是否重复噪声
+  
+  # 评估指标配置
+  metrics:
+    # === 有参考指标 ===
+    psnr:
+      fr: True                   # 全参考
+      better: higher
+    ssim:
+      fr: True
+      better: higher
+    lpips:
+      fr: True
+      better: lower
+    # fid:
+    #   fr: True
+    #   better: lower
+    # dists:
+    #   fr: True
+    #   better: lower
+    
+    # === 无参考指标 ===
+    niqe:
+      fr: False                  # 无参考
+      better: lower
+    clipiqa:
+      fr: False
+      better: higher
+    musiq:
+      fr: False
+      better: higher
+    maniqa:
+      fr: False
+      better: higher
+    # brisque:
+    #   fr: False
+    #   better: lower
+    # pi:
+    #   fr: False
+    #   better: lower
+
+# 日志设置
+logger:
+  print_freq: 10
+  save_checkpoint_freq: ~
+  use_tb_logger: false
+  wandb:
+    project: ~
+    resume_id: ~
+
+# 分布式设置(推理不需要)
+dist_params:
+  backend: nccl
+  port: 29500
