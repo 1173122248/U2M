@@ -329,11 +329,22 @@ class GaussianDiffusion:
             "pred_xstart": pred_xstart,
         }
 
+    def _predict_eps_from_xstart(self, x_t, y, un, t, pred_xstart):
+        un_safe = un.clamp(min=1e-3)
+        return (
+            x_t
+            - _extract_into_tensor(1 - self.etas, t, x_t.shape) * pred_xstart
+            - _extract_into_tensor(self.etas, t, x_t.shape) * y
+        ) / (_extract_into_tensor(self.kappa * self.sqrt_etas, t, x_t.shape) * un_safe)
+    
+    
     def _predict_xstart_from_eps(self, x_t, y, un, t, eps):
-        assert x_t.shape == eps.shape
-        return  (
-            x_t - _extract_into_tensor(self.sqrt_etas, t, x_t.shape) * self.kappa * un * eps
-        ) / (1 - _extract_into_tensor(self.etas, t, x_t.shape) * un)
+        un_safe = un.clamp(min=1e-3)
+        return (
+            x_t
+            - _extract_into_tensor(self.etas, t, x_t.shape) * y
+            - _extract_into_tensor(self.kappa * self.sqrt_etas, t, x_t.shape) * un_safe * eps
+        ) / _extract_into_tensor(1 - self.etas, t, x_t.shape)
 
     def _predict_xstart_from_eps_scale(self, x_t, y, un, t, eps):
         assert x_t.shape == eps.shape
@@ -345,11 +356,6 @@ class GaussianDiffusion:
         assert y.shape == residual.shape
         return (y - residual)
 
-    def _predict_eps_from_xstart(self, x_t, y, un, t, pred_xstart):
-        return (
-            x_t - _extract_into_tensor(1 - self.etas, t, x_t.shape) * pred_xstart
-                - _extract_into_tensor(self.etas, t, x_t.shape) * y
-        ) / _extract_into_tensor(self.kappa * self.sqrt_etas, t, x_t.shape)
 
     def p_sample(self, model, x, y, y_hat, un, t, clip_denoised=True, denoised_fn=None, model_kwargs=None, noise_repeat=False):
         """
@@ -600,10 +606,11 @@ class GaussianDiffusion:
 
     def _scale_input(self, inputs, un, t):
         if self.normalize_input:
-            # ⚠️ 暂时禁用uncertainty调制,使用固定值
-            # 先训练好U²M网络,再逐步启用去噪阶段的调制
-            var_un = 0.3  # 固定值,不使用预测的un
-            std = torch.sqrt(_extract_into_tensor(self.etas, t, inputs.shape) * self.kappa**2 * var_un + 0.5**2)
+            un_safe = un.clamp(min=1e-3, max=1.0)
+            std = torch.sqrt(
+                _extract_into_tensor(self.etas, t, inputs.shape) * (self.kappa ** 2) * (un_safe ** 2)
+                + 0.5 ** 2
+            )
             inputs_norm = inputs / std
         else:
             inputs_norm = inputs
@@ -618,55 +625,53 @@ class GaussianDiffusion:
         model_kwargs=None,
         ddim_eta=0.0,
     ):
-        """
-        Sample x_{t-1} from the model using DDIM.
-        
-        若model_kwargs中有'pred_xstart_override',则使用ε空间扰动后的x_0预测
-        (U²M动态注入方案)
-
-        Same usage as p_sample().
-        """
-        # 检查是否有ε空间扰动后的pred_xstart
-        if model_kwargs is not None and 'pred_xstart_override' in model_kwargs:
-            # 使用U²M扰动后的x_0预测
-            pred_xstart = model_kwargs['pred_xstart_override']
-            # 清除标记,避免重复使用
-            model_kwargs.pop('pred_xstart_override', None)
+        pred_xstart_override = None
+        net_kwargs = {}
+    
+        if model_kwargs is not None:
+            pred_xstart_override = model_kwargs.pop('pred_xstart_override', None)
             model_kwargs.pop('eps_perturbed', None)
+            net_kwargs = model_kwargs
+    
+        if pred_xstart_override is not None:
+            pred_xstart = pred_xstart_override
+            if denoised_fn is not None:
+                pred_xstart = denoised_fn(pred_xstart)
+            if clip_denoised:
+                pred_xstart = pred_xstart.clamp(-1, 1)
         else:
-            # 正常流程: 调用模型预测
             out = self.p_mean_variance(
                 model=model,
                 x_t=x,
                 y=y,
                 y_hat=y_hat,
-                un=un, 
+                un=un,
                 t=t,
                 clip_denoised=clip_denoised,
                 denoised_fn=denoised_fn,
-                model_kwargs=model_kwargs,
+                model_kwargs=net_kwargs,
             )
             pred_xstart = out["pred_xstart"]
+    
         etas = _extract_into_tensor(self.etas, t, x.shape)
         etas_prev = _extract_into_tensor(self.etas_prev, t, x.shape)
         alpha = _extract_into_tensor(self.alpha, t, x.shape)
         sigma = ddim_eta * self.kappa * torch.sqrt(etas_prev / etas) * torch.sqrt(alpha)
-
+    
         m_t = torch.sqrt(etas_prev / etas)
-
         k_t = (1 - etas_prev - (1 - etas) * m_t)
-
         y_t = (etas_prev - torch.sqrt(etas * etas_prev)) * y
-
+    
         noise = torch.randn_like(x)
-        mean_pred = (
-            pred_xstart * k_t + x * m_t + y_t
-        )
-        nonzero_mask = (
-            (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
-        )  # no noise when t == 0
+        mean_pred = pred_xstart * k_t + x * m_t + y_t
+        nonzero_mask = (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
         sample = mean_pred + nonzero_mask * sigma * noise
-        return {"sample": sample, "pred_xstart": out["pred_xstart"]}
+    
+        return {
+            "sample": sample,
+            "pred_xstart": pred_xstart,
+            "mean": mean_pred,
+        }
 
     def ddim_sample_loop(
         self,
@@ -892,25 +897,30 @@ class GaussianDiffusion:
                     model_kwargs['pred_xstart_override'] = pred_xstart_new
                     model_kwargs['eps_perturbed'] = eps_perturbed
                 
-                # 过滤model_kwargs,只保留UNet需要的参数(lq)
-                filtered_kwargs = {}
-                if model_kwargs is not None:
-                    # 只保留lq等UNet forward需要的参数,排除U2M相关参数
-                    unet_keys = ['lq']
-                    for key in unet_keys:
-                        if key in model_kwargs:
-                            filtered_kwargs[key] = model_kwargs[key]
-                
-                out = self.ddim_sample(
-                    model=model,
-                    x=x_sample,
-                    y=y, y_hat=y_hat, un=model_kwargs.get('un', un),
-                    t=t,
-                    clip_denoised=clip_denoised,
-                    denoised_fn=denoised_fn,
-                    model_kwargs=filtered_kwargs,
-                    ddim_eta=ddim_eta,
-                )
+                    # 传给ddim_sample的参数：
+                    # - lq: 给UNet正常条件输入
+                    # - pred_xstart_override: 给DDIM当前步直接覆盖x0预测
+                    sample_kwargs = {}
+                    if model_kwargs is not None:
+                        if 'lq' in model_kwargs:
+                            sample_kwargs['lq'] = model_kwargs['lq']
+                        if 'pred_xstart_override' in model_kwargs:
+                            sample_kwargs['pred_xstart_override'] = model_kwargs['pred_xstart_override']
+                        if 'eps_perturbed' in model_kwargs:
+                            sample_kwargs['eps_perturbed'] = model_kwargs['eps_perturbed']
+
+                    out = self.ddim_sample(
+                        model=model,
+                        x=x_sample,
+                        y=y,
+                        y_hat=y_hat,
+                        un=model_kwargs.get('un', un),
+                        t=t,
+                        clip_denoised=clip_denoised,
+                        denoised_fn=denoised_fn,
+                        model_kwargs=sample_kwargs,
+                        ddim_eta=ddim_eta,
+                    )
                 if one_step:
                     out["sample"] = out["pred_xstart"]
                     yield out
