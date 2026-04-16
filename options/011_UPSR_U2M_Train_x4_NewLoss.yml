@@ -180,7 +180,7 @@ diffusion:
     predict_type: xstart
     timestep_respacing:
     scale_factor: 1.0
-    normalize_input: True
+    normalize_input: False
     latent_flag: False
   # === 动态U2M反向去噪配置 (内容自适应注入方案 - 改进版) ===
   # 
